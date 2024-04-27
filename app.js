@@ -1,57 +1,103 @@
-require('dotenv').config();
+require('dotenv').config()
 
-// Imports dependencies and set up http server
-const express = require('express');
-const body_parser = require('body-parser');
-const axios = require("axios");
+const TelegramBot = require('node-telegram-bot-api');
+const fetchAndCleanArticle = require('./src/fetchAndCleanArticle');
+const convertToEpub = require('./src/convertToEpub');
+const { sendMail } = require('./utils/sendMail');
+const { isGoogleDoc, extractDocument } = require('./utils/googleDocs');
+const slugify = require("slugify");
+const {rename} = require("fs");
+const {join} = require("path");
 
-const { getLastPublishedAt, saveLastPublishedDate}  = require("./utils/supabase");
-const { sendTelegramMessage } = require("./utils/telegram");
+// Replace 'YOUR_TELEGRAM_BOT_TOKEN' with your actual Telegram bot token
+const token = process.env.TELEGRAM_TOKEN;
+const bot = new TelegramBot(token, { polling: true });
 
-const app = express().use(body_parser.json()); // creates express http server
+// Nodemailer setup (replace with your SMTP details)
 
-const fetchJobs = async () => {
-    const url = process.env.JOBS_API_URL;
-    const response = await axios.get(url);
-    return response.data.data
-};
+// Function to extract text from URL
+async function getArticleContent(url) {
+    try {
+        const {
+            cleanedContent: article,
+            title,
+            author,
+        } = await fetchAndCleanArticle(url);
 
-
-const sendNewJobs = async () => {
-
-    const lastEntryPublishedDate = await getLastPublishedAt();
-
-    const jobs = await fetchJobs();
-    const newJobs = jobs.filter(job => new Date(job.published_at) > new Date(lastEntryPublishedDate));
-
-
-    if (newJobs.length > 0) {
-        for (const job of newJobs) {
-            await sendTelegramMessage(`New job posted: ${job.title} - ${job.link}`);
+        if (!article) {
+            return null;
         }
 
-        await saveLastPublishedDate(jobs[0]);
-        return 'OK - new jobs sent'
-    }
+        const path = await convertToEpub(article, title, author);
 
-    return 'No new jobs'
+        return {
+            title,
+            path,
+        };
+
+    } catch (error) {
+        console.error('Error fetching article:', error);
+        return null;
+    }
 }
 
-// Sets server port and logs message on success
-app.listen(process.env.PORT || 1337, () => console.log('webhook is listening', process.env.PORT || 1337));
 
-app.get('/main', async (req, res) =>{
+// Telegram bot command listener, triggered when user sends a message
+bot.on('message', async (msg) => {
+    console.log('Message received:', msg);
+    const chatId = msg.chat.id;
+    const url = msg.text;
+
     try {
-        const response = await sendNewJobs(req, res);
-        res.send(response);
+        if (msg.document) {
+            // Handle document files
+            const fileId = msg.document.file_id;
+            const safeName = slugify(msg.document.file_name, {
+                lower: true,      // Convert to lower case
+            });
+            const downloadDir = './public';
+            const downloadPath = join(downloadDir, safeName);
+
+            // Download the document
+            bot.downloadFile(fileId, downloadDir).then(
+                filePath => {
+                    // Rename the downloaded file to its safe name
+                    const tempPath = filePath;
+                    rename(tempPath, downloadPath, (err) => {
+                        if (err) {
+                            console.error('Error renaming the downloaded file:', err);
+                            return;
+                        }
+                        console.log(`File downloaded and saved as ${downloadPath}`);
+                    });
+                    sendMail(safeName, downloadPath, 'file');
+                },
+                error => console.error('Error downloading file:', error)
+            );
+        } else if (isGoogleDoc(url)) {
+            const {
+                filename,
+                filepath
+            } = await extractDocument(url);
+
+            await sendMail(filename, filepath, 'docx');
+        }
+        else if (/http(s)?:\/\/[^\s]+/.test(url)) {
+            // Call your URL to EPUB conversion function
+            const {
+                title: filename,
+                path: filepath,
+            } = await getArticleContent(url);
+
+            await sendMail(filename, filepath);
+        } else {
+            await bot.sendMessage(chatId, "Please send a valid URL.");
+        }
     } catch (error) {
-        await sendTelegramMessage("Bot is down");
-    } finally {
-        res.end();
+        console.error('Error processing message:', error);
+        // Send an error message to the user
+        await bot.sendMessage(chatId, "An error occurred. Please try again later.");
     }
 });
 
-// health check endpoint
-app.get("/health", async(req, res) => {
-    res.send("OK");
-});
+console.log('Bot server is running...');
